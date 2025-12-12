@@ -1,0 +1,39 @@
+No files changed, compilation skipped
+Script ran successfully.
+
+== Logs ==
+  Deployer address: 0xe769800585E8f2dFe7AC396dd2d9201A1E95FEa6
+  PoolManager address: 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543
+  Deploying AIMHook to: 0x5d50Dc1eC0DF66a46521fEb657b5E9b6e76b0088
+  Using salt: 0x0000000000000000000000000000000000000000000000000000000000004d99
+  AIMHook deployed successfully at: 0x5d50Dc1eC0DF66a46521fEb657b5E9b6e76b0088
+
+## Setting up 1 EVM.
+
+==========================
+
+Chain 11155111
+
+Estimated gas price: 0.001025015 gwei
+
+Estimated total gas used for script: 4907953
+
+Estimated amount required: 0.000005030725444295 ETH
+
+==========================
+
+
+==========================
+
+ONCHAIN EXECUTION COMPLETE & SUCCESSFUL.
+Warning: We haven't found any matching bytecode for the following contracts: [0x5d50dc1ec0df66a46521feb657b5e9b6e76b0088].
+
+This may occur when resuming a verification, but the underlying source code or compiler version has changed.
+##
+Start verification for (0) contracts
+All (0) contracts were verified!
+
+Transactions saved to: /home/bn-yusuf/Documents/Codes/Uniswap/AIMHook/broadcast/Deploy.s.sol/11155111/run-latest.json
+
+Sensitive values saved to: /home/bn-yusuf/Documents/Codes/Uniswap/AIMHook/cache/Deploy.s.sol/11155111/run-latest.json
+

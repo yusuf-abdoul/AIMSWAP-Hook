@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIMHook - Privacy-Preserving Swaps</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen py-12 px-4">
+    <div class="container mx-auto max-w-2xl">
+        <h1 class="text-4xl font-bold text-center mb-8">AIMHook Privacy Swaps</h1>
+
+        <!-- Wallet Connection -->
+        <div id="wallet-section" class="bg-white p-6 rounded-lg shadow mb-6">
+            <button id="connect-btn" class="w-full bg-blue-600 text-white px-6 py-3 rounded hover:bg-blue-700">
+                Connect Wallet
+            </button>
+            <div id="wallet-info" class="hidden mt-4">
+                <p class="text-sm">Connected: <span id="address" class="font-mono"></span></p>
+                <p class="text-sm">Balance: <span id="balance"></span> ETH</p>
+            </div>
+        </div>
+
+        <!-- Swap Interface (Simplified - No FHE for now) -->
+        <div id="swap-section" class="bg-white p-6 rounded-lg shadow mb-6">
+            <h2 class="text-2xl font-bold mb-4">Create Swap Intent</h2>
+
+            <div class="mb-4">
+                <label class="block text-sm font-medium mb-2">Direction</label>
+                <select id="direction" class="w-full px-4 py-2 border rounded">
+                    <option value="true">Token0 → Token1</option>
+                    <option value="false">Token1 → Token0</option>
+                </select>
+            </div>
+
+            <div class="mb-4">
+                <label class="block text-sm font-medium mb-2">Amount</label>
+                <input type="number" id="amount" placeholder="0.0" class="w-full px-4 py-2 border rounded" step="0.01">
+            </div>
+
+            <div class="mb-4">
+                <label class="block text-sm font-medium mb-2">Minimum Return</label>
+                <input type="number" id="minReturn" placeholder="0.0" class="w-full px-4 py-2 border rounded" step="0.01">
+            </div>
+
+            <button id="approve-btn" class="w-full bg-orange-600 text-white px-6 py-3 rounded hover:bg-orange-700 mb-2 hidden">
+                Approve Tokens
+            </button>
+
+            <button id="swap-btn" class="w-full bg-blue-600 text-white px-6 py-3 rounded hover:bg-blue-700" disabled>
+                Submit Intent (Connect Wallet First)
+            </button>
+
+            <div id="status" class="mt-4 p-3 rounded hidden"></div>
+        </div>
+
+        <!-- Contract Info -->
+        <div class="bg-white p-6 rounded-lg shadow">
+            <h3 class="font-bold mb-2">Contract Addresses</h3>
+            <p class="text-xs font-mono break-all mb-1">AIMHook: 0x5d50Dc1eC0DF66a46521fEb657b5E9b6e76b0088</p>
+            <p class="text-xs font-mono break-all mb-1">PoolManager: 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543</p>
+            <p class="text-xs font-mono break-all mb-1">Token0: 0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9</p>
+            <p class="text-xs font-mono break-all">Token1: 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238</p>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const CONFIG = {
+            POOL_MANAGER: '0xE03A1074c86CFeDd5C142C4F04F1a1536e203543',
+            AIM_HOOK: '0x5d50Dc1eC0DF66a46521fEb657b5E9b6e76b0088',
+            TOKEN0: '0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9',
+            TOKEN1: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',
+            CHAIN_ID: 11155111
+        };
+
+        const ERC20_ABI = [
+            'function approve(address spender, uint256 amount) external returns (bool)',
+            'function allowance(address owner, address spender) external view returns (uint256)',
+        ];
+
+        const POOL_MANAGER_ABI = [
+            'function swap(tuple(address,address,uint24,int24,address) key, tuple(bool,int256,uint160) params, bytes hookData) external returns (int256)'
+        ];
+
+        let provider, signer, userAddress;
+
+        // Connect Wallet
+        document.getElementById('connect-btn').addEventListener('click', async () => {
+            try {
+                await ethereum.request({ method: 'eth_requestAccounts' });
+                provider = new ethers.providers.Web3Provider(window.ethereum);
+                signer = provider.getSigner();
+                userAddress = await signer.getAddress();
+
+                const balance = await provider.getBalance(userAddress);
+
+                document.getElementById('address').textContent = userAddress.slice(0, 6) + '...' + userAddress.slice(-4);
+                document.getElementById('balance').textContent = ethers.utils.formatEther(balance);
+                document.getElementById('wallet-info').classList.remove('hidden');
+                document.getElementById('swap-btn').disabled = false;
+                document.getElementById('swap-btn').textContent = 'Check Approval';
+
+                await checkAllowance();
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        });
+
+        async function checkAllowance() {
+            const zeroForOne = document.getElementById('direction').value === 'true';
+            const tokenAddress = zeroForOne ? CONFIG.TOKEN0 : CONFIG.TOKEN1;
+            const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
+
+            const allowance = await token.allowance(userAddress, CONFIG.AIM_HOOK);
+
+            if (allowance.eq(0)) {
+                document.getElementById('approve-btn').classList.remove('hidden');
+                document.getElementById('swap-btn').textContent = 'Approve First';
+            } else {
+                document.getElementById('approve-btn').classList.add('hidden');
+                document.getElementById('swap-btn').textContent = 'Submit Intent';
+            }
+        }
+
+        // Approve
+        document.getElementById('approve-btn').addEventListener('click', async () => {
+            try {
+                showStatus('Approving tokens...', 'info');
+                const zeroForOne = document.getElementById('direction').value === 'true';
+                const tokenAddress = zeroForOne ? CONFIG.TOKEN0 : CONFIG.TOKEN1;
+                const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
+
+                const tx = await token.approve(CONFIG.AIM_HOOK, ethers.constants.MaxUint256);
+                await tx.wait();
+
+                showStatus('Tokens approved!', 'success');
+                await checkAllowance();
+            } catch (error) {
+                showStatus('Approval failed: ' + error.message, 'error');
+            }
+        });
+
+        // Submit Swap (Simplified - No FHE encryption)
+        document.getElementById('swap-btn').addEventListener('click', async () => {
+            const amount = document.getElementById('amount').value;
+            const minReturn = document.getElementById('minReturn').value;
+
+            if (!amount || !minReturn) {
+                showStatus('Please enter amounts', 'error');
+                return;
+            }
+
+            try {
+                showStatus('Note: This simplified version bypasses FHE encryption. Use backend scripts for full privacy.', 'info');
+
+                // For now, just show what would happen
+                // Full implementation would require fhenixjs which has the WASM issue
+                showStatus('❌ FHE encryption requires fhenixjs. Please use backend script: npm run example:encrypt', 'error');
+
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        });
+
+        function showStatus(message, type) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.classList.remove('hidden', 'bg-blue-100', 'bg-green-100', 'bg-red-100');
+
+            if (type === 'info') statusDiv.classList.add('bg-blue-100');
+            if (type === 'success') statusDiv.classList.add('bg-green-100');
+            if (type === 'error') statusDiv.classList.add('bg-red-100');
+        }
+    </script>
+</body>
+</html>
