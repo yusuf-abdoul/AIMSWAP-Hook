@@ -28,6 +28,15 @@ const ERC20_ABI = [
     outputs: [{ type: 'uint256' }]
   },
   {
+    name: 'balanceOf',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'account', type: 'address' }
+    ],
+    outputs: [{ type: 'uint256' }]
+  },
+  {
     name: 'symbol',
     type: 'function',
     stateMutability: 'view',
@@ -51,7 +60,7 @@ export default function SwapIntent() {
   const { address } = useAccount();
   const publicClient = usePublicClient();
   const { data: walletClient } = useWalletClient();
-  const { fhenixClient, isLoading: fheLoading, error: fheError } = useFhenix();
+  const { cofheClient, isLoading: fheLoading, error: fheError } = useFhenix();
 
   const [inputAmount, setInputAmount] = useState('');
   const [slippage, setSlippage] = useState('0.5'); // Default 0.5% slippage
@@ -64,37 +73,110 @@ export default function SwapIntent() {
   const [tokenSymbol, setTokenSymbol] = useState<string>('');
   const [useFHE, setUseFHE] = useState(false); // Disable FHE by default for demo
 
+  // User-configurable token addresses
+  const [token0Input, setToken0Input] = useState(process.env.NEXT_PUBLIC_TOKEN0 || '');
+  const [token1Input, setToken1Input] = useState(process.env.NEXT_PUBLIC_TOKEN1 || '');
+  const [token0Symbol, setToken0Symbol] = useState('Token0');
+  const [token1Symbol, setToken1Symbol] = useState('Token1');
+  const [token0Balance, setToken0Balance] = useState<string>('0');
+  const [token1Balance, setToken1Balance] = useState<string>('0');
+  const [token0Decimals, setToken0Decimals] = useState<number>(18);
+  const [token1Decimals, setToken1Decimals] = useState<number>(18);
+
   // Contract addresses
   const SWAP_TEST = process.env.NEXT_PUBLIC_SWAP_TEST || '';
   const AIM_HOOK = process.env.NEXT_PUBLIC_AIM_HOOK || '';
-  const TOKEN0 = process.env.NEXT_PUBLIC_TOKEN0 || '';
-  const TOKEN1 = process.env.NEXT_PUBLIC_TOKEN1 || '';
+
+  // Use user input or fallback to env
+  const TOKEN0 = token0Input;
+  const TOKEN1 = token1Input;
 
   // Get the token we're selling based on direction
   const getInputToken = () => (zeroForOne ? TOKEN0 : TOKEN1);
 
+  // Fetch token info when addresses change
+  useEffect(() => {
+    const fetchTokenInfo = async () => {
+      if (!publicClient || !address) return;
+
+      try {
+        if (TOKEN0 && ethers.isAddress(TOKEN0)) {
+          const [symbol0, balance0, decimals0] = await Promise.all([
+            publicClient.readContract({
+              address: TOKEN0 as `0x${string}`,
+              abi: ERC20_ABI,
+              functionName: 'symbol'
+            } as any),
+            publicClient.readContract({
+              address: TOKEN0 as `0x${string}`,
+              abi: ERC20_ABI,
+              functionName: 'balanceOf',
+              args: [address]
+            } as any),
+            publicClient.readContract({
+              address: TOKEN0 as `0x${string}`,
+              abi: ERC20_ABI,
+              functionName: 'decimals'
+            } as any)
+          ]);
+          setToken0Symbol(symbol0 as string);
+          setToken0Decimals(decimals0 as number);
+          setToken0Balance(ethers.formatUnits(balance0 as bigint, decimals0 as number));
+        }
+
+        if (TOKEN1 && ethers.isAddress(TOKEN1)) {
+          const [symbol1, balance1, decimals1] = await Promise.all([
+            publicClient.readContract({
+              address: TOKEN1 as `0x${string}`,
+              abi: ERC20_ABI,
+              functionName: 'symbol'
+            } as any),
+            publicClient.readContract({
+              address: TOKEN1 as `0x${string}`,
+              abi: ERC20_ABI,
+              functionName: 'balanceOf',
+              args: [address]
+            } as any),
+            publicClient.readContract({
+              address: TOKEN1 as `0x${string}`,
+              abi: ERC20_ABI,
+              functionName: 'decimals'
+            } as any)
+          ]);
+          setToken1Symbol(symbol1 as string);
+          setToken1Decimals(decimals1 as number);
+          setToken1Balance(ethers.formatUnits(balance1 as bigint, decimals1 as number));
+        }
+      } catch (error) {
+        console.error('Error fetching token info:', error);
+      }
+    };
+
+    fetchTokenInfo();
+  }, [TOKEN0, TOKEN1, publicClient, address]);
+
   // Check allowance when component loads or direction changes
   useEffect(() => {
     const checkAllowance = async () => {
-      if (!address || !walletClient || !publicClient || !AIM_HOOK) return;
+      if (!address || !walletClient || !publicClient || !SWAP_TEST) return;
 
       try {
         const inputToken = getInputToken();
-        if (!inputToken) return;
+        if (!inputToken || !ethers.isAddress(inputToken)) return;
 
         // Use publicClient for read operations
         const currentAllowance = await publicClient.readContract({
           address: inputToken as `0x${string}`,
           abi: ERC20_ABI,
           functionName: 'allowance',
-          args: [address, AIM_HOOK as `0x${string}`]
-        });
+          args: [address, SWAP_TEST as `0x${string}`]
+        } as any);
 
         const symbol = await publicClient.readContract({
           address: inputToken as `0x${string}`,
           abi: ERC20_ABI,
           functionName: 'symbol'
-        });
+        } as any);
 
         setAllowance(currentAllowance as bigint);
         setTokenSymbol(symbol as string);
@@ -104,7 +186,7 @@ export default function SwapIntent() {
     };
 
     checkAllowance();
-  }, [address, walletClient, publicClient, AIM_HOOK, zeroForOne, TOKEN0, TOKEN1]);
+  }, [address, walletClient, publicClient, SWAP_TEST, zeroForOne, TOKEN0, TOKEN1]);
 
   // Handle token approval
   const handleApprove = async () => {
@@ -117,13 +199,13 @@ export default function SwapIntent() {
       setApproving(true);
       const inputToken = getInputToken();
 
-      console.log('Approving AIMHook to spend tokens...');
+      console.log('Approving SwapTest to spend tokens...');
 
       const hash = await walletClient.writeContract({
         address: inputToken as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'approve',
-        args: [AIM_HOOK as `0x${string}`, ethers.MaxUint256]
+        args: [SWAP_TEST as `0x${string}`, ethers.MaxUint256]
       });
 
       console.log('Approval transaction submitted:', hash);
@@ -134,8 +216,8 @@ export default function SwapIntent() {
         address: inputToken as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'allowance',
-        args: [address, AIM_HOOK as `0x${string}`]
-      });
+        args: [address, SWAP_TEST as `0x${string}`]
+      } as any);
 
       setAllowance(newAllowance as bigint);
 
@@ -152,7 +234,8 @@ export default function SwapIntent() {
   const hasAllowance = () => {
     if (!inputAmount) return true;
     try {
-      const amountWei = ethers.parseEther(inputAmount);
+      const decimals = zeroForOne ? token0Decimals : token1Decimals;
+      const amountWei = ethers.parseUnits(inputAmount, decimals);
       return allowance >= amountWei;
     } catch {
       return false;
@@ -165,8 +248,8 @@ export default function SwapIntent() {
       return;
     }
 
-    if (useFHE && !fhenixClient) {
-      alert('FHE client not initialized. Please wait...');
+    if (useFHE && !cofheClient) {
+      alert('CoFHE client not initialized. Please wait...');
       return;
     }
 
@@ -178,8 +261,11 @@ export default function SwapIntent() {
     try {
       setLoading(true);
 
-      // Convert amounts to wei
-      const amountWei = ethers.parseEther(inputAmount);
+      // Get correct decimals for input token
+      const inputDecimals = zeroForOne ? token0Decimals : token1Decimals;
+
+      // Convert amounts using correct decimals
+      const amountWei = ethers.parseUnits(inputAmount, inputDecimals);
 
       // Calculate minimum return with slippage
       // For demo: assume 1:1 price ratio, apply slippage
@@ -188,15 +274,58 @@ export default function SwapIntent() {
 
       let hookData: `0x${string}`;
 
-      if (useFHE && fhenixClient) {
-        // Encrypt amounts using FHE
+      if (useFHE && cofheClient) {
+        // Encrypt amounts using CoFHE
         setEncrypting(true);
-        console.log('Encrypting amounts with fhenixjs@0.4.2-alpha.2...');
-        const encryptedAmount = await fhenixClient.encrypt_uint128(amountWei);
-        const encryptedMinReturn = await fhenixClient.encrypt_uint128(minReturnWei);
-        setEncrypting(false);
+        console.log('Encrypting amounts with cofhejs...');
+        console.log('Amount:', amountWei.toString());
+        console.log('Min return:', minReturnWei.toString());
 
-        // Encode FHE encrypted hookData
+        const { cofhejs, Encryptable } = cofheClient;
+
+        try {
+          // Use cofhejs encryption (returns InEuint128 format directly)
+          const encryptedAmount = await cofhejs.encrypt(Encryptable.uint128(amountWei));
+          const encryptedMinReturn = await cofhejs.encrypt(Encryptable.uint128(minReturnWei));
+
+          console.log('Encrypted amount:', encryptedAmount);
+          console.log('Encrypted minReturn:', encryptedMinReturn);
+
+          // Verify encrypted values
+          if (!encryptedAmount || !encryptedMinReturn) {
+            throw new Error('Encryption returned null values');
+          }
+
+          setEncrypting(false);
+
+          // cofhejs returns the correct InEuint128 format
+          hookData = ethers.AbiCoder.defaultAbiCoder().encode(
+            [
+              'tuple(uint256 ctHash, uint8 securityZone, uint8 utype, bytes signature)',
+              'tuple(uint256 ctHash, uint8 securityZone, uint8 utype, bytes signature)'
+            ],
+            [
+              [
+                encryptedAmount.ctHash || 0,
+                encryptedAmount.securityZone || 0,
+                encryptedAmount.utype || 7,
+                encryptedAmount.signature || '0x'
+              ],
+              [
+                encryptedMinReturn.ctHash || 0,
+                encryptedMinReturn.securityZone || 0,
+                encryptedMinReturn.utype || 7,
+                encryptedMinReturn.signature || '0x'
+              ]
+            ]
+          ) as `0x${string}`;
+        } catch (encryptError: any) {
+          setEncrypting(false);
+          throw new Error(`Encryption failed: ${encryptError.message}`);
+        }
+      } else {
+        // Demo mode: encode in InEuint128 format with dummy values
+        console.log('Demo mode: Using plain values in encrypted format');
         hookData = ethers.AbiCoder.defaultAbiCoder().encode(
           [
             'tuple(uint256 ctHash, uint8 securityZone, uint8 utype, bytes signature)',
@@ -204,35 +333,28 @@ export default function SwapIntent() {
           ],
           [
             [
-              encryptedAmount.data,
-              encryptedAmount.securityZone,
-              7, // utype for euint128
-              encryptedAmount.signature
+              amountWei,      // Use amount as ctHash (demo only)
+              0,              // securityZone
+              7,              // utype for euint128
+              '0x'            // empty signature
             ],
             [
-              encryptedMinReturn.data,
-              encryptedMinReturn.securityZone,
-              7,
-              encryptedMinReturn.signature
+              minReturnWei,   // Use minReturn as ctHash (demo only)
+              0,              // securityZone
+              7,              // utype for euint128
+              '0x'            // empty signature
             ]
           ]
-        ) as `0x${string}`;
-      } else {
-        // Demo mode: encode plain values
-        console.log('Demo mode: Using plain values (no encryption)');
-        hookData = ethers.AbiCoder.defaultAbiCoder().encode(
-          ['uint256', 'uint256'],
-          [amountWei, minReturnWei]
         ) as `0x${string}`;
       }
 
       // Pool key configuration
       const poolKey = {
-        currency0: TOKEN0,
-        currency1: TOKEN1,
+        currency0: TOKEN0 as `0x${string}`,
+        currency1: TOKEN1 as `0x${string}`,
         fee: 3000,
         tickSpacing: 60,
-        hooks: AIM_HOOK
+        hooks: AIM_HOOK as `0x${string}`
       };
 
       // Swap params
@@ -306,7 +428,21 @@ export default function SwapIntent() {
 
     } catch (error: any) {
       console.error('Error submitting intent:', error);
-      alert(`Error: ${error.message}`);
+
+      // Better error messages
+      let errorMsg = error.message || 'Unknown error';
+
+      if (errorMsg.includes('PoolNotInitialized') || errorMsg.includes('not initialized')) {
+        errorMsg = 'Pool not initialized. You need to initialize a pool with these tokens first.';
+      } else if (errorMsg.includes('insufficient') || errorMsg.includes('balance')) {
+        errorMsg = 'Insufficient token balance. Make sure you have enough tokens.';
+      } else if (errorMsg.includes('allowance')) {
+        errorMsg = 'Token allowance issue. Try approving again.';
+      } else if (errorMsg.includes('reverted')) {
+        errorMsg = `Transaction reverted. This pool may not exist or have liquidity.\n\nSteps to fix:\n1. Deploy tokens on Sepolia\n2. Initialize a pool via PoolManager\n3. Add liquidity to the pool\n4. Then try swapping`;
+      }
+
+      alert(`Swap failed: ${errorMsg}`);
     } finally {
       setLoading(false);
       setEncrypting(false);
@@ -318,6 +454,53 @@ export default function SwapIntent() {
       <h2 className="text-2xl font-bold mb-6 text-gray-800">
         Create Private Swap Intent
       </h2>
+
+      {/* Token Selection */}
+      <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded">
+        <p className="text-sm font-semibold text-blue-900 mb-3">Select Token Pair</p>
+
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-medium text-blue-900 mb-1">
+              Token0 Address
+            </label>
+            <input
+              type="text"
+              value={token0Input}
+              onChange={(e) => setToken0Input(e.target.value)}
+              placeholder="0x..."
+              className="w-full px-3 py-2 text-sm border border-blue-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono"
+            />
+            {token0Symbol && (
+              <p className="text-xs text-blue-700 mt-1">
+                {token0Symbol} • Balance: {parseFloat(token0Balance).toFixed(4)}
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-blue-900 mb-1">
+              Token1 Address
+            </label>
+            <input
+              type="text"
+              value={token1Input}
+              onChange={(e) => setToken1Input(e.target.value)}
+              placeholder="0x..."
+              className="w-full px-3 py-2 text-sm border border-blue-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono"
+            />
+            {token1Symbol && (
+              <p className="text-xs text-blue-700 mt-1">
+                {token1Symbol} • Balance: {parseFloat(token1Balance).toFixed(4)}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <p className="text-xs text-blue-600 mt-3">
+          💡 Enter any ERC20 token addresses. If a Uniswap v4 pool exists with these tokens, you can swap!
+        </p>
+      </div>
 
       {/* Demo Mode Toggle */}
       <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded">
@@ -338,13 +521,13 @@ export default function SwapIntent() {
         <p className="text-xs text-yellow-700">
           {useFHE ? (
             fheLoading ? (
-              'Loading FHE client...'
+              'Loading CoFHE client...'
             ) : fheError ? (
-              `FHE Error: ${fheError}`
-            ) : fhenixClient ? (
-              '✓ FHE client ready'
+              `CoFHE Error: ${fheError}`
+            ) : cofheClient ? (
+              '✓ CoFHE client ready (Fhenix CoProcessor)'
             ) : (
-              'Initializing FHE encryption...'
+              'Initializing CoFHE encryption...'
             )
           ) : (
             'Using plain values for demo - encryption disabled'
@@ -355,7 +538,7 @@ export default function SwapIntent() {
       {/* Swap Direction */}
       <div className="mb-4">
         <label className="block text-sm font-medium text-gray-700 mb-2">
-          Direction
+          Swap Direction
         </label>
         <div className="flex space-x-4">
           <button
@@ -366,7 +549,7 @@ export default function SwapIntent() {
                 : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
             }`}
           >
-            Token0 → Token1
+            {token0Symbol} → {token1Symbol}
           </button>
           <button
             onClick={() => setZeroForOne(false)}
@@ -376,7 +559,7 @@ export default function SwapIntent() {
                 : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
             }`}
           >
-            Token1 → Token0
+            {token1Symbol} → {token0Symbol}
           </button>
         </div>
       </div>
@@ -389,8 +572,15 @@ export default function SwapIntent() {
         <input
           type="number"
           value={inputAmount}
-          onChange={(e) => setInputAmount(e.target.value)}
+          onChange={(e) => {
+            const value = e.target.value;
+            // Only allow positive numbers
+            if (value === '' || parseFloat(value) >= 0) {
+              setInputAmount(value);
+            }
+          }}
           placeholder="0.0"
+          min="0"
           step="0.01"
           className="w-full px-4 py-2 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent"
         />
@@ -482,7 +672,7 @@ export default function SwapIntent() {
       {/* Submit Button */}
       <button
         onClick={handleSubmitIntent}
-        disabled={loading || !address || !hasAllowance() || (useFHE && (!fhenixClient || fheLoading))}
+        disabled={loading || !address || !hasAllowance() || (useFHE && (!cofheClient || fheLoading))}
         className="w-full px-6 py-3 bg-blue-600 text-white font-semibold rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
       >
         {loading ? (
@@ -513,19 +703,31 @@ export default function SwapIntent() {
         </div>
       )}
 
+      {/* Help Text */}
+      <div className="mt-6 p-4 bg-gray-50 border border-gray-200 rounded">
+        <p className="text-xs font-semibold text-gray-700 mb-2">How to Use</p>
+        <div className="text-xs text-gray-600 space-y-1">
+          <ol className="list-decimal ml-4 space-y-1">
+            <li>Enter token addresses above (or use the defaults)</li>
+            <li>Make sure you have a balance of the input token</li>
+            <li>Approve the token for SwapTest</li>
+            <li>Enter amount and select slippage</li>
+            <li>Click swap!</li>
+          </ol>
+          <p className="mt-2 text-xs text-orange-600">
+            ⚠️ Note: Pool must exist with liquidity. If swap fails, the pool may not be initialized.
+          </p>
+        </div>
+      </div>
+
       {/* Contract Info */}
-      <div className="mt-6 p-3 bg-gray-50 border border-gray-200 rounded">
-        <p className="text-xs font-semibold text-gray-700 mb-2">Deployed Contracts (Unichain Sepolia)</p>
+      <div className="mt-4 p-3 bg-gray-50 border border-gray-200 rounded">
+        <p className="text-xs font-semibold text-gray-700 mb-2">Deployed Contracts (Sepolia)</p>
         <div className="space-y-1 text-xs text-gray-600 font-mono">
           <p className="truncate">AIMHook: {AIM_HOOK}</p>
           <p className="truncate">SwapTest: {SWAP_TEST}</p>
         </div>
       </div>
-
-      {/* Help Text */}
-      <p className="mt-4 text-xs text-gray-500 text-center">
-        For production use with full FHE encryption, run the backend script from the project root.
-      </p>
     </div>
   );
 }

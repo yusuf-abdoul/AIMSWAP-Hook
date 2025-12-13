@@ -1,17 +1,16 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { FhenixClient } from 'fhenixjs';
-import { usePublicClient } from 'wagmi';
+import { usePublicClient, useWalletClient } from 'wagmi';
 
 interface FhenixContextType {
-  fhenixClient: FhenixClient | null;
+  cofheClient: any | null;
   isLoading: boolean;
   error: string | null;
 }
 
 const FhenixContext = createContext<FhenixContextType>({
-  fhenixClient: null,
+  cofheClient: null,
   isLoading: true,
   error: null,
 });
@@ -19,84 +18,72 @@ const FhenixContext = createContext<FhenixContextType>({
 export const useFhenix = () => useContext(FhenixContext);
 
 export function FhenixProvider({ children }: { children: React.ReactNode }) {
-  const [fhenixClient, setFhenixClient] = useState<FhenixClient | null>(null);
+  const [cofheClient, setCofheClient] = useState<any | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const publicClient = usePublicClient();
+  const { data: walletClient } = useWalletClient();
 
   useEffect(() => {
-    async function initFhenix() {
+    async function initCofhe() {
       if (typeof window === 'undefined') {
+        setIsLoading(false);
+        return;
+      }
+
+      if (!publicClient || !walletClient) {
         setIsLoading(false);
         return;
       }
 
       try {
         setIsLoading(true);
-        console.log('Initializing FhenixClient for CoFHE...');
+        console.log('Initializing cofhejs for CoFHE on Sepolia...');
 
-        // Create a provider that proxies FHE-specific calls to Fhenix CoFHE API
-        const fhenixRpc = process.env.NEXT_PUBLIC_FHENIX_RPC || 'https://api.helium.fhenix.zone';
+        // Dynamically import cofhejs/web for browser environment
+        const { cofhejs, Encryptable } = await import('cofhejs/web');
 
-        const provider = {
-          request: async (args: any) => {
-            // Intercept FHE-specific RPC calls and forward to Fhenix API
-            if (args.method === 'eth_getPublicKey' || args.method === 'fhe_getPublicKey') {
-              console.log('Fetching FHE public key from Fhenix CoFHE...');
-              const response = await fetch(fhenixRpc, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  jsonrpc: '2.0',
-                  id: 1,
-                  method: args.method,
-                  params: args.params || []
-                })
-              });
-              const data = await response.json();
-              if (data.error) throw new Error(data.error.message);
-              return data.result;
-            }
+        console.log('Imported cofhejs successfully');
+        console.log('Provider chain ID:', await publicClient.getChainId());
 
-            // For chain ID, return Unichain Sepolia
-            if (args.method === 'eth_chainId') {
-              return '0x515'; // 1301 in hex
-            }
+        // Initialize with Sepolia provider and wallet signer
+        console.log('Calling cofhejs.initialize...');
+        const initResult = await cofhejs.initialize({
+          provider: publicClient as any,
+          signer: walletClient as any
+        });
 
-            // For other calls, use the Sepolia provider
-            if (publicClient && (publicClient as any).request) {
-              return (publicClient as any).request(args);
-            }
+        console.log('cofhejs.initialize result:', initResult);
+        console.log('cofhejs initialized successfully');
 
-            // Fallback to window.ethereum
-            if (window.ethereum) {
-              return window.ethereum.request(args);
-            }
+        // Create permit for decryption access
+        console.log('Creating CoFHE permit...');
+        const permitResult = await cofhejs.createPermit();
+        console.log('Permit result:', permitResult);
+        console.log('Permit created successfully');
 
-            throw new Error(`Unsupported method: ${args.method}`);
-          }
-        };
+        // Get and log the permit
+        const permit = cofhejs.getPermit();
+        console.log('Retrieved permit:', permit);
 
-        const client = new FhenixClient({ provider: provider as any });
-
-        setFhenixClient(client);
+        // Store both cofhejs and Encryptable helper
+        setCofheClient({ cofhejs, Encryptable });
         setError(null);
-        console.log('FhenixClient initialized successfully with CoFHE');
+        console.log('CoFHE client ready for Sepolia!');
       } catch (err: any) {
-        console.error('Failed to initialize FhenixClient:', err);
-        setError(err.message || 'Failed to initialize FHE client');
+        console.error('Failed to initialize cofhejs:', err);
+        console.error('Error stack:', err.stack);
+        setError(err.message || 'Failed to initialize CoFHE client');
       } finally {
         setIsLoading(false);
       }
     }
 
-    if (publicClient) {
-      initFhenix();
-    }
-  }, [publicClient]);
+    initCofhe();
+  }, [publicClient, walletClient]);
 
   return (
-    <FhenixContext.Provider value={{ fhenixClient, isLoading, error }}>
+    <FhenixContext.Provider value={{ cofheClient, isLoading, error }}>
       {children}
     </FhenixContext.Provider>
   );

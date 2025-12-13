@@ -18,10 +18,10 @@ const nextConfig = {
       },
     });
 
-    // Ignore fhenixjs on server-side to avoid WASM issues
+    // Ignore FHE libraries on server-side to avoid WASM issues
     if (isServer) {
       config.externals = config.externals || [];
-      config.externals.push('fhenixjs');
+      config.externals.push('fhenixjs', 'cofhejs', 'cofhejs/web');
     }
 
     // Polyfills for Web3 libraries
