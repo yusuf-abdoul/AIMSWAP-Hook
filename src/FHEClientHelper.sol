@@ -13,7 +13,7 @@ library FHEClientHelper {
     function validateInEuint128(InEuint128 memory input) internal pure returns (bool isValid) {
         // Basic validation checks
         if (input.ctHash == 0) return false;
-        if (input.utype != 7) return false; // euint128 has type 7
+        if (input.utype != 6) return false; // euint128 has type 6 (EUINT128_TFHE)
         // Additional validation: signature should not be empty in production
         if (input.signature.length == 0) return false;
         return true;
@@ -38,8 +38,8 @@ library FHEClientHelper {
         return InEuint128({
             ctHash: uint256(keccak256(abi.encodePacked(value, nonce))),
             securityZone: 0,
-            utype: 7,
-            signature: abi.encodePacked(bytes32(nonce))
+            utype: 6, // EUINT128_TFHE
+            signature: abi.encode(uint256(value), nonce)
         });
     }
 
@@ -53,7 +53,7 @@ library FHEClientHelper {
             ctHash: uint256(keccak256(abi.encodePacked(value, nonce))),
             securityZone: 0,
             utype: 0,
-            signature: abi.encodePacked(bytes32(nonce))
+            signature: abi.encode(value ? uint256(1) : uint256(0), nonce)
         });
     }
 

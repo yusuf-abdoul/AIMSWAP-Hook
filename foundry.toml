@@ -3,27 +3,37 @@ src = "src"
 out = "out"
 libs = ["lib"]
 remappings = [
-    "@fhenixprotocol/=lib/cofhe-contracts/src/",
+    "@fhenixprotocol/cofhe-contracts/=lib/cofhe-contracts/contracts/",
     "@uniswap/v4-core/=lib/v4-core/",
     "@v4-periphery/=lib/v4-periphery/src/",
-    "forge-std/=lib/forge-std/src/"
+    "forge-std/=lib/forge-std/src/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
 ]
 
 solc_version = '0.8.26'
 evm_version = "cancun"
 optimizer = true
-optimizer_runs = 1000000
+optimizer_runs = 200
 via_ir = true
 ffi = true
 isolate = true  # Required for proper FHE permission checks
 
+fs_permissions = [
+    { access = "read-write", path = "./deployments/" }
+]
+
 # RPC endpoints
 [rpc_endpoints]
-sepolia = "${SEPOLIA_RPC_URL}"
-fhenix = "${FHENIX_COPROCESSOR_RPC}"
+arb_sepolia = "${ARB_SEPOLIA_RPC}"
+eth_sepolia = "${ETH_SEPOLIA_RPC}"
+
+# Integration test profile (real FHE on forked chain)
+[profile.integration]
+test = "test/integration"
+ffi = true
+fs_permissions = [{ access = "read-write", path = "./deployments/" }]
 
 # Etherscan configuration for contract verification
 [etherscan]
-sepolia = { key = "${ETHERSCAN_API_KEY}" }
-
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+arb_sepolia = { key = "${ARBISCAN_API_KEY}" }
+eth_sepolia = { key = "${ETHERSCAN_API_KEY}" }

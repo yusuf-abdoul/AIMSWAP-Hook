@@ -1,30 +1,10 @@
-import { FhenixClient } from 'fhenixjs';
+/**
+ * @deprecated This file used the old fhenixjs library.
+ * FHE operations now go through the server-side API route at /api/fhe
+ * using cofhejs/node. See components/FhenixProvider.tsx for the new client.
+ */
 
-let fhenixClientInstance: FhenixClient | null = null;
-
-export async function initFhenixClient(provider?: any): Promise<FhenixClient> {
-  if (typeof window === 'undefined') {
-    throw new Error('FhenixClient can only be initialized in browser environment');
-  }
-
-  if (fhenixClientInstance) {
-    return fhenixClientInstance;
-  }
-
-  try {
-    // Initialize FhenixClient with custom WASM path
-    fhenixClientInstance = new FhenixClient({
-      provider: provider || window.ethereum,
-    });
-
-    console.log('FhenixClient initialized successfully');
-    return fhenixClientInstance;
-  } catch (error) {
-    console.error('Failed to initialize FhenixClient:', error);
-    throw error;
-  }
-}
-
-export function getFhenixClient(): FhenixClient | null {
-  return fhenixClientInstance;
+export function getFhenixClient(): null {
+  console.warn('getFhenixClient() is deprecated. Use the FhenixProvider context instead.');
+  return null;
 }

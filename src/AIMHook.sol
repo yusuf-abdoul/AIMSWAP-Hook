@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.26;
 
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
@@ -25,13 +25,19 @@ import {
 import "./AIMStorage.sol";
 import "./AIMMatcher.sol";
 import "./AIMSettlement.sol";
+import "./AIMFHE.sol";
+import "./FHEClientHelper.sol";
 
 /// @title AIMHook - Asynchronous Intent Matcher Hook
-/// @notice Privacy-preserving CoW protocol for Uniswap v4
-
+/// @notice Privacy-preserving CoW protocol for Uniswap v4 using Fhenix CoFHE.
+/// @dev Encrypts swap amounts and directions end-to-end. Matching happens on
+///      encrypted values via the CoFHE coprocessor. Settlement occurs after
+///      async decryption completes, triggered by keepers.
+///
+///      Supported chains: Arbitrum Sepolia (421614), Ethereum Sepolia (11155111)
+///      FHE stack: Fhenix cofhe-contracts with cofhejs frontend SDK
 contract AIMHook is BaseHook, ReentrancyGuardTransient {
     using AIMStorage for AIMStorage.Storage;
-    AIMStorage.Storage internal s;
 
     // Simple nonce for intent ID uniqueness per owner
     mapping(address => uint256) public ownerNonces;
@@ -39,18 +45,17 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
     // Store PoolKeys for settlement (poolId => PoolKey)
     mapping(bytes32 => PoolKey) public poolKeys;
 
+    // --- Events ---
     event IntentCreated(
         bytes32 indexed poolId,
         bytes32 indexed intentId,
-        address owner,
-        euint128 amount,
+        address indexed owner,
         uint32 expireBlock
     );
     event IntentMatched(
         bytes32 indexed poolId,
         bytes32 indexed intentA,
-        bytes32 indexed intentB,
-        uint128 amountMatched
+        bytes32 indexed intentB
     );
     event IntentSettled(
         bytes32 indexed poolId,
@@ -59,26 +64,32 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
     );
     event IntentExpired(bytes32 indexed poolId, bytes32 indexed intentId);
 
+    // --- Errors ---
+    error InvalidEncryptedInput();
+    error IntentsNotMatched();
+    error DecryptionNotReady();
+
     /// @notice Constructor
     /// @param _poolManager Uniswap v4 PoolManager address
     /// @param defaultMatchWindowBlocks_ Blocks before intent expires
-    /// @param scanLimit_ Max intents to scan per match
+    /// @param scanLimit_ Max intents to scan per match attempt
     constructor(
         IPoolManager _poolManager,
         uint32 defaultMatchWindowBlocks_,
         uint8 scanLimit_
     ) BaseHook(_poolManager) {
+        AIMStorage.Storage storage s = AIMStorage.store();
+        s.defaultMatchWindowBlocks = defaultMatchWindowBlocks_;
+        s.scanLimit = scanLimit_;
 
-        AIMStorage.Storage storage st = AIMStorage.store();
-        st.defaultMatchWindowBlocks = defaultMatchWindowBlocks_;
-        st.scanLimit = scanLimit_;
-
-        // Initialize encrypted constants
-        st.ENCRYPTED_ZERO = FHE.asEuint128(0);
-        FHE.allowThis(st.ENCRYPTED_ZERO);
+        // Initialize all encrypted constants with proper FHE.allowThis() permissions
+        AIMFHE.initConstants(s);
     }
 
-    /// @notice Define which hooks are used
+    // ─────────────────────────────────────────────
+    // Hook Permissions
+    // ─────────────────────────────────────────────
+
     function getHookPermissions()
         public
         pure
@@ -93,19 +104,22 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
                 afterAddLiquidity: false,
                 beforeRemoveLiquidity: false,
                 afterRemoveLiquidity: false,
-                beforeSwap: true, // ✅ Check for matches
-                afterSwap: false, // Could use for cleanup
+                beforeSwap: true,                    // Intercept swaps for intent matching
+                afterSwap: false,
                 beforeDonate: false,
                 afterDonate: false,
-                beforeSwapReturnDelta: true, // ✅ REQUIRED to prevent AMM when matched
+                beforeSwapReturnDelta: true,          // Can prevent AMM when matched
                 afterSwapReturnDelta: false,
                 afterAddLiquidityReturnDelta: false,
                 afterRemoveLiquidityReturnDelta: false
             });
     }
 
-    /// @notice Hook called before every swap
-    /// @dev This is where intent matching logic runs
+    // ─────────────────────────────────────────────
+    // Core Hook Logic
+    // ─────────────────────────────────────────────
+
+    /// @notice Hook called before every swap - entry point for intent matching
     function _beforeSwap(
         address sender,
         PoolKey calldata key,
@@ -123,9 +137,15 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
             poolKeys[poolId] = key;
         }
 
-        // Decode encrypted intent data from hookData
+        // Decode and validate encrypted intent data from hookData
         (InEuint128 memory encAmount, InEuint128 memory encMinReturn) = abi
             .decode(hookData, (InEuint128, InEuint128));
+
+        // Validate encrypted inputs before processing
+        if (!FHEClientHelper.validateInEuint128(encAmount) ||
+            !FHEClientHelper.validateInEuint128(encMinReturn)) {
+            revert InvalidEncryptedInput();
+        }
 
         // Try to match with existing opposite intent
         (bool matched, bytes32 matchedIntentId) = _handleIntent(
@@ -137,32 +157,27 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
         );
 
         if (matched) {
-            // Intent matched - PREVENT AMM swap
-            // With beforeSwapReturnDelta: true, returning any delta prevents AMM
-            // Settlement happens later via settleMatchedIntents() after FHE decryption
-            emit IntentMatched(poolId, bytes32(0), matchedIntentId, 0);
-
-            // Return specified delta to prevent AMM interaction
-            // Note: Actual amounts unknown until FHE decryption completes
+            // Intent matched - prevent AMM swap, settlement happens via keeper
             return (
                 BaseHook.beforeSwap.selector,
-                BeforeSwapDeltaLibrary.ZERO_DELTA, // Hook is handling this swap
+                BeforeSwapDeltaLibrary.ZERO_DELTA,
                 0
             );
         } else {
-            // No match - ALLOW AMM swap to proceed
-            // Returning ZERO_DELTA with no override lets swap continue to AMM
-            // AMM uses pool's sqrtPriceX96 for pricing (no external oracle needed)
+            // No match found - let AMM swap proceed normally
             return (
                 BaseHook.beforeSwap.selector,
-                BeforeSwapDeltaLibrary.ZERO_DELTA, // Let AMM handle normally
+                BeforeSwapDeltaLibrary.ZERO_DELTA,
                 0
             );
         }
     }
 
+    // ─────────────────────────────────────────────
+    // Intent Creation & Matching
+    // ─────────────────────────────────────────────
+
     /// @notice Handle intent creation and matching
-    /// @dev Optimized with unchecked arithmetic and cached storage reads
     function _handleIntent(
         bytes32 poolId,
         address owner,
@@ -170,31 +185,33 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
         InEuint128 memory encAmount,
         InEuint128 memory encMinReturn
     ) internal returns (bool matched, bytes32 matchedId) {
-        AIMStorage.Storage storage ss = AIMStorage.store();
+        AIMStorage.Storage storage s = AIMStorage.store();
 
-        // Convert client-encrypted inputs to contract euint128
+        // Convert client-encrypted inputs to contract euint128/ebool
         euint128 amount = FHE.asEuint128(encAmount);
         euint128 minReturn = FHE.asEuint128(encMinReturn);
         ebool direction = FHE.asEbool(zeroForOne);
 
-        // Create new intent with cached storage values
-        uint32 created = uint32(block.number);
-        uint32 matchWindow = ss.defaultMatchWindowBlocks; // Cache storage read
-        uint32 expire;
-        unchecked {
-            expire = created + matchWindow; // Safe: block number won't overflow
-        }
-        uint256 nonce = ownerNonces[owner];
-        unchecked {
-            ownerNonces[owner] = nonce + 1; // Use unchecked increment
-        }
+        // CRITICAL: Grant contract access to all encrypted values
+        FHE.allowThis(amount);
+        FHE.allowThis(minReturn);
+        FHE.allowThis(direction);
 
-        bytes32 intentId = AIMStorage.makeIntentId(
-            poolId,
-            owner,
-            nonce,
-            created
-        );
+        // Grant sender access to their encrypted data (for unsealing)
+        FHE.allow(amount, owner);
+        FHE.allow(minReturn, owner);
+        FHE.allow(direction, owner);
+
+        // Create new intent
+        uint32 created = uint32(block.number);
+        uint32 matchWindow = s.defaultMatchWindowBlocks;
+        uint32 expire;
+        unchecked { expire = created + matchWindow; }
+
+        uint256 nonce = ownerNonces[owner];
+        unchecked { ownerNonces[owner] = nonce + 1; }
+
+        bytes32 intentId = AIMStorage.makeIntentId(poolId, owner, nonce, created);
 
         AIMStorage.Intent memory newIntent = AIMStorage.Intent({
             owner: owner,
@@ -204,140 +221,140 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
             createdBlock: created,
             expireBlock: expire,
             status: AIMStorage.IntentStatus.PENDING,
-            decryptHandle: 0
+            matchedWith: bytes32(0)
         });
 
-        // Grant contract access to encrypted fields
-        FHE.allowThis(amount);
-        FHE.allowThis(minReturn);
-        FHE.allowThis(direction);
-
-        // Try to find matching intent
+        // Try to find matching intent using FHE comparisons
         (
             bytes32 otherId,
             AIMStorage.Intent storage otherIntent,
             bool found
-        ) = AIMMatcher.findMatch(ss, poolId, newIntent);
+        ) = AIMMatcher.findMatch(s, poolId, newIntent);
 
         if (found) {
-            // Match found - settle directly
-            _settleMatchedIntents(
-                poolId,
-                intentId,
-                newIntent,
-                otherId,
-                otherIntent
-            );
+            // Immediate match (decryption was fast or cached)
+            // Store intent, mark both as MATCHED, link them
+            AIMStorage.PoolIntents storage pi = s.pools[poolId];
+            pi.intents[intentId] = newIntent;
+            pi.intents[intentId].status = AIMStorage.IntentStatus.MATCHED;
+            pi.intents[intentId].matchedWith = otherId;
+            pi.userIntents[owner].push(intentId);
+
+            otherIntent.status = AIMStorage.IntentStatus.MATCHED;
+            otherIntent.matchedWith = intentId;
+
+            // Request decryption of amounts for settlement
+            FHE.decrypt(amount);
+            FHE.decrypt(otherIntent.amount);
+            FHE.decrypt(direction);
+
+            // Track decryption requests
+            AIMFHE.requestDecryption(s, intentId, amount);
+            AIMFHE.requestDecryption(s, otherId, otherIntent.amount);
+
+            emit IntentMatched(poolId, intentId, otherId);
             return (true, otherId);
         } else {
-            // No match - store for future matching
-            AIMStorage.PoolIntents storage pi = ss.pools[poolId];
+            // No match - store intent in queue for future matching
+            AIMStorage.PoolIntents storage pi = s.pools[poolId];
             pi.intents[intentId] = newIntent;
-            pi.intentIds.push(intentId); // Add to FIFO queue
-            pi.userIntents[owner].push(intentId); // Track per user
-
-            // Grant user access to their encrypted data
-            FHE.allowSender(amount);
-            FHE.allowSender(minReturn);
-            FHE.allowSender(direction);
+            pi.intentIds.push(intentId);
+            pi.userIntents[owner].push(intentId);
 
             // Request async decryption for future settlement
             FHE.decrypt(amount);
+            FHE.decrypt(direction);
+            AIMFHE.requestDecryption(s, intentId, amount);
 
-            emit IntentCreated(poolId, intentId, owner, amount, expire);
+            emit IntentCreated(poolId, intentId, owner, expire);
             return (false, bytes32(0));
         }
     }
 
-    /// @notice Settle two matched intents directly (peer-to-peer)
-    function _settleMatchedIntents(
+    // ─────────────────────────────────────────────
+    // Settlement (Keeper-triggered)
+    // ─────────────────────────────────────────────
+
+    /// @notice Settle two matched intents after FHE decryption completes
+    /// @param poolId The pool ID
+    /// @param intentAId First intent ID
+    /// @param intentBId Second intent ID
+    /// @dev Can be called by anyone (keepers/bots) after decryption resolves
+    function settleMatchedIntents(
         bytes32 poolId,
         bytes32 intentAId,
-        AIMStorage.Intent memory intentA,
-        bytes32 intentBId,
-        AIMStorage.Intent storage intentB
-    ) internal nonReentrant {
-        AIMStorage.Storage storage ss = AIMStorage.store();
+        bytes32 intentBId
+    ) external nonReentrant {
+        AIMStorage.Storage storage s = AIMStorage.store();
+        AIMStorage.Intent storage intentA = s.pools[poolId].intents[intentAId];
+        AIMStorage.Intent storage intentB = s.pools[poolId].intents[intentBId];
 
-        // Wait for amounts to be decrypted
-        (uint128 amountA, bool aDecrypted) = FHE.getDecryptResultSafe(intentA.amount);
-        (uint128 amountB, bool bDecrypted) = FHE.getDecryptResultSafe(intentB.amount);
-
-        require(aDecrypted && bDecrypted, "Amounts not decrypted yet");
-
-        // Calculate matched amount (minimum of both)
-        uint128 matchedAmount = amountA < amountB ? amountA : amountB;
-
-        // Get direction (need decryption)
-        (bool aZeroForOne, bool dirDecrypted) = FHE.getDecryptResultSafe(intentA.zeroForOne);
-        require(dirDecrypted, "Direction not decrypted yet");
-
-        // Mark both intents as matched
-        ss.pools[poolId].intents[intentAId].status = AIMStorage.IntentStatus.MATCHED;
-        intentB.status = AIMStorage.IntentStatus.MATCHED;
-
-        // TODO: Actual token transfers would happen here via PoolManager
-        // For now, we just emit the settlement event
-
-        emit IntentSettled(poolId, intentAId, matchedAmount);
-        emit IntentSettled(poolId, intentBId, matchedAmount);
-
-        // Update statuses to settled
-        ss.pools[poolId].intents[intentAId].status = AIMStorage.IntentStatus.SETTLED;
-        intentB.status = AIMStorage.IntentStatus.SETTLED;
-
-        // Handle partial fills
-        if (amountA > matchedAmount) {
-            // Intent A partially filled - keep remaining in queue
-            ss.pools[poolId].intents[intentAId].amount = FHE.asEuint128(amountA - matchedAmount);
-            ss.pools[poolId].intents[intentAId].status = AIMStorage.IntentStatus.PENDING; // Back to pending
-            FHE.allowThis(ss.pools[poolId].intents[intentAId].amount);
+        // Verify both intents are in MATCHED status
+        if (intentA.status != AIMStorage.IntentStatus.MATCHED ||
+            intentB.status != AIMStorage.IntentStatus.MATCHED) {
+            revert IntentsNotMatched();
         }
 
-        if (amountB > matchedAmount) {
-            // Intent B partially filled
-            intentB.amount = FHE.asEuint128(amountB - matchedAmount);
-            intentB.status = AIMStorage.IntentStatus.PENDING; // Back to pending
-            FHE.allowThis(intentB.amount);
-        }
+        // Execute settlement via AIMSettlement library
+        AIMSettlement.settleTwoIntents(
+            s,
+            poolId,
+            poolKeys[poolId],
+            intentAId,
+            intentA,
+            intentBId,
+            intentB
+        );
+
+        // Get settled amount for event (after settlement updated state)
+        (uint128 settledA, ) = AIMFHE.pollDecryption(s, intentAId);
+
+        emit IntentSettled(poolId, intentAId, settledA);
+        emit IntentSettled(poolId, intentBId, settledA);
     }
+
+    // ─────────────────────────────────────────────
+    // Maintenance
+    // ─────────────────────────────────────────────
 
     /// @notice Cleanup expired intents from a pool
     /// @param poolId The pool to cleanup
-    /// @param maxToProcess Maximum number of intents to process
+    /// @param maxToProcess Maximum number of intents to process (gas bound)
     function cleanupExpired(bytes32 poolId, uint256 maxToProcess) external {
-        AIMStorage.Storage storage ss = AIMStorage.store();
-        AIMStorage.PoolIntents storage pi = ss.pools[poolId];
+        AIMStorage.Storage storage s = AIMStorage.store();
+        AIMStorage.PoolIntents storage pi = s.pools[poolId];
 
-        uint256 processed = 0;
-        uint256 i = 0;
+        uint256 processed;
+        uint256 i;
 
         while (i < pi.intentIds.length && processed < maxToProcess) {
             bytes32 id = pi.intentIds[i];
             AIMStorage.Intent storage intent = pi.intents[id];
 
-            if (intent.status == AIMStorage.IntentStatus.PENDING && block.number > intent.expireBlock) {
-                intent.status = AIMStorage.IntentStatus.EXPIRED; // Mark as expired
+            if (intent.status == AIMStorage.IntentStatus.PENDING &&
+                block.number > intent.expireBlock)
+            {
+                intent.status = AIMStorage.IntentStatus.EXPIRED;
                 emit IntentExpired(poolId, id);
 
-                // Remove from array by swapping with last element
+                // Swap-and-pop removal from array
                 uint256 lastIndex = pi.intentIds.length - 1;
                 if (i != lastIndex) {
                     pi.intentIds[i] = pi.intentIds[lastIndex];
                 }
                 pi.intentIds.pop();
-                processed++;
-                // Don't increment i since we swapped a new element into this position
-                continue;
+                unchecked { ++processed; }
+                continue; // Don't increment i (new element swapped in)
             }
-            i++;
+            unchecked { ++i; }
         }
     }
 
-    /// @notice Get intent details (for UI/debugging)
-    /// @param poolId The pool ID
-    /// @param intentId The intent ID
-    /// @return The intent struct
+    // ─────────────────────────────────────────────
+    // View Functions
+    // ─────────────────────────────────────────────
+
+    /// @notice Get intent details
     function getIntent(bytes32 poolId, bytes32 intentId)
         external
         view
@@ -347,9 +364,6 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
     }
 
     /// @notice Get all intent IDs for a user in a pool
-    /// @param poolId The pool ID
-    /// @param user The user address
-    /// @return Array of intent IDs
     function getUserIntents(bytes32 poolId, address user)
         external
         view
@@ -359,8 +373,6 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
     }
 
     /// @notice Get total number of active intents in a pool
-    /// @param poolId The pool ID
-    /// @return Number of intents
     function getPoolIntentCount(bytes32 poolId)
         external
         view
@@ -369,53 +381,12 @@ contract AIMHook is BaseHook, ReentrancyGuardTransient {
         return AIMStorage.store().pools[poolId].intentIds.length;
     }
 
-    /// @notice Manually trigger settlement for two matched intents
-    /// @param poolId The pool ID
-    /// @param intentAId First intent ID
-    /// @param intentBId Second intent ID
-    /// @dev Can be called by anyone after FHE decryption completes
-    /// @dev Useful for keepers/bots to finalize settlements
-    function settleMatchedIntents(
-        bytes32 poolId,
-        bytes32 intentAId,
-        bytes32 intentBId
-    ) external nonReentrant {
-        AIMStorage.Storage storage ss = AIMStorage.store();
-        AIMStorage.Intent storage intentA = ss.pools[poolId].intents[intentAId];
-        AIMStorage.Intent storage intentB = ss.pools[poolId].intents[intentBId];
-
-        // Verify both intents are in MATCHED status
-        require(
-            intentA.status == AIMStorage.IntentStatus.MATCHED &&
-            intentB.status == AIMStorage.IntentStatus.MATCHED,
-            "Intents not matched"
-        );
-
-        // Wait for amounts to be decrypted
-        (uint128 amountA, bool aDecrypted) = FHE.getDecryptResultSafe(intentA.amount);
-        (uint128 amountB, bool bDecrypted) = FHE.getDecryptResultSafe(intentB.amount);
-
-        require(aDecrypted && bDecrypted, "Amounts not decrypted yet");
-
-        // Get direction
-        (bool aZeroForOne, bool dirDecrypted) = FHE.getDecryptResultSafe(intentA.zeroForOne);
-        require(dirDecrypted, "Direction not decrypted");
-
-        // Calculate matched amount
-        uint128 matchedAmount = amountA < amountB ? amountA : amountB;
-
-        // Use AIMSettlement library for actual token transfers
-        AIMSettlement.settleTwoIntents(
-            poolManager,
-            poolId,
-            poolKeys[poolId],
-            intentAId,
-            intentA,
-            intentBId,
-            intentB
-        );
-
-        emit IntentSettled(poolId, intentAId, matchedAmount);
-        emit IntentSettled(poolId, intentBId, matchedAmount);
+    /// @notice Get the matched counterpart for an intent
+    function getMatchedIntent(bytes32 poolId, bytes32 intentId)
+        external
+        view
+        returns (bytes32)
+    {
+        return AIMStorage.store().pools[poolId].intents[intentId].matchedWith;
     }
 }
