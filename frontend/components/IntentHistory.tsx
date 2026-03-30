@@ -3,7 +3,6 @@
 import { useState, useEffect } from 'react';
 import { useAccount, useWatchContractEvent } from 'wagmi';
 import { ethers } from 'ethers';
-import { FhenixClient } from 'fhenixjs';
 
 interface Intent {
   intentId: string;
